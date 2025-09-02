@@ -1,0 +1,207 @@
+# cifar10_cnn_runner.py
+import argparse
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+from torch.utils.data import DataLoader, Dataset
+import torchvision
+import torchvision.transforms as transforms
+
+from ConvolutionalNN_Pytorch import ConvolutionalNN_Pytorch
+from ConvolutionalNN_Numpy   import ConvolutionalNN_Numpy
+
+
+def torch_loaders(batch_size=128, num_workers=2, pin_memory=True, normalize=True):
+    if normalize:
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465),
+                                 (0.2470, 0.2435, 0.2616)),
+        ])
+    else:
+        transform = transforms.ToTensor()
+
+    train_ds = torchvision.datasets.CIFAR10(root="./data", train=True,  download=True, transform=transform)
+    test_ds  = torchvision.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
+    return train_ds, test_ds
+
+
+# --- restrict to ["cat","dog"] and shrink size ---
+class RemapSubset(Dataset):
+    def __init__(self, base_ds, indices, class_id_map):
+        self.base = base_ds
+        self.indices = list(indices)
+        self.class_id_map = class_id_map
+    def __len__(self):
+        return len(self.indices)
+    def __getitem__(self, i):
+        j = self.indices[i]
+        x, y = self.base[j]
+        return x, self.class_id_map[y]
+
+
+def make_small_cat_dog(train_ds, test_ds, train_per_class=1000, test_per_class=200):
+    all_names = train_ds.classes
+    cat_id = all_names.index("cat")
+    dog_id = all_names.index("dog")
+    remap = {cat_id: 0, dog_id: 1}
+
+    tr_labels = train_ds.targets if hasattr(train_ds, "targets") else train_ds.labels
+    te_labels = test_ds.targets if hasattr(test_ds, "targets") else test_ds.labels
+
+    # collect capped indices
+    buckets_tr = {cat_id: [], dog_id: []}
+    for i, y in enumerate(tr_labels):
+        if y in buckets_tr and len(buckets_tr[y]) < train_per_class:
+            buckets_tr[y].append(i)
+    tr_idxs = buckets_tr[cat_id] + buckets_tr[dog_id]
+
+    buckets_te = {cat_id: [], dog_id: []}
+    for i, y in enumerate(te_labels):
+        if y in buckets_te and len(buckets_te[y]) < test_per_class:
+            buckets_te[y].append(i)
+    te_idxs = buckets_te[cat_id] + buckets_te[dog_id]
+
+    train_small = RemapSubset(train_ds, tr_idxs, remap)
+    test_small  = RemapSubset(test_ds,  te_idxs,  remap)
+    return train_small, test_small, ["cat", "dog"]
+
+
+def dataloader_to_numpy_epoch(dataloader):
+    np_batches = []
+    for xb, yb in dataloader:
+        xb_np = xb.detach().cpu().numpy().astype(np.float32)
+        yb_np = yb.detach().cpu().numpy().astype(np.int64)
+        np_batches.append((xb_np, yb_np))
+    return np_batches
+
+
+def visualize_samples(images, labels, preds, class_names, n=6, title="Pred vs True"):
+    n = min(n, images.shape[0])
+    fig, axes = plt.subplots(1, n, figsize=(2*n, 3))
+    for i in range(n):
+        img = images[i]
+        if isinstance(img, torch.Tensor):
+            img = img.detach().cpu()
+        if img.ndim == 3 and img.shape[0] in (1,3):
+            img = img.permute(1, 2, 0)
+        img = img.numpy() if isinstance(img, torch.Tensor) else img
+        img = (img - img.min()) / (img.max() - img.min() + 1e-7)
+        axes[i].imshow(img)
+        p = int(preds[i])
+        t = int(labels[i])
+        axes[i].set_title(f"Pred: {class_names[p]}\nTrue: {class_names[t]}", fontsize=9)
+        axes[i].axis("off")
+    plt.suptitle(title)
+    plt.tight_layout()
+    plt.show()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train a CNN on CIFAR-10 cat vs dog (small subset).")
+    parser.add_argument("--backend", default="pytorch", choices=["numpy", "pytorch"])
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--optimizer", default="momentum", choices=["sgd", "momentum", "adam"])
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--beta", type=float, default=0.9)
+    parser.add_argument("--beta2", type=float, default=0.999)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--conv_channels", nargs="+", type=int, default=[8, 16])  # <-- smaller by default
+    parser.add_argument("--kernel_size", type=int, default=3)
+    parser.add_argument("--pool_size", type=int, default=2)
+    parser.add_argument("--hidden_units", nargs="+", type=int, default=[64])      # <-- smaller FC too
+    parser.add_argument("--use_padding", action="store_true", default=True)
+    parser.add_argument("--no_padding", action="store_true")
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--pool_every", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=2)
+    args = parser.parse_args()
+
+    use_padding = False if args.no_padding else args.use_padding
+
+    # --- Base CIFAR-10 ---
+    train_full, test_full = torch_loaders(batch_size=args.batch_size,
+                                          num_workers=args.num_workers,
+                                          pin_memory=True,
+                                          normalize=True)
+
+    # --- Small cat/dog dataset ---
+    TRAIN_PER_CLASS = 200
+    TEST_PER_CLASS = 20
+    train_ds, test_ds, class_names = make_small_cat_dog(train_full, test_full,
+                                                        train_per_class=TRAIN_PER_CLASS,
+                                                        test_per_class=TEST_PER_CLASS)
+
+    train_loader_torch = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                                    num_workers=args.num_workers, pin_memory=True)
+    test_loader_torch  = DataLoader(test_ds, batch_size=max(256, args.batch_size), shuffle=False,
+                                    num_workers=args.num_workers, pin_memory=True)
+    num_classes = 2
+
+    if args.backend.lower() == "pytorch":
+        model = ConvolutionalNN_Pytorch(
+            input_channels=3,
+            conv_channels=args.conv_channels,
+            conv_dim=2,
+            kernel_size=args.kernel_size,
+            pool_size=args.pool_size,
+            num_classes=num_classes,
+            hidden_units=args.hidden_units,
+            use_padding=use_padding,
+            dropout=args.dropout,
+            pool_every=args.pool_every,
+            conv_stride=1
+        )
+        history = model.Train(
+            train_loader_torch,
+            val_loader=test_loader_torch,
+            epochs=args.epochs,
+            optimizer_name=args.optimizer,
+            lr=args.lr,
+            beta=args.beta,
+            beta1=args.beta,
+            beta2=args.beta2,
+            weight_decay=args.weight_decay,
+            pool_every=args.pool_every,
+            conv_stride=1,
+            conv_padding=None if use_padding else 0,
+        )
+        images, labels = next(iter(test_loader_torch))
+        preds, _ = model.predict(images[:6], return_prob=True)
+        visualize_samples(images[:6], labels[:6], preds, class_names, n=6, title="PyTorch cat/dog small")
+    else:
+        train_loader_np = dataloader_to_numpy_epoch(train_loader_torch)
+        test_loader_np  = dataloader_to_numpy_epoch(test_loader_torch)
+        model = ConvolutionalNN_Numpy(
+            input_channels=3,
+            conv_channels=args.conv_channels,
+            conv_dim=2,
+            kernel_size=args.kernel_size,
+            pool_size=args.pool_size,
+            num_classes=num_classes,
+            hidden_units=args.hidden_units,
+            use_padding=use_padding,
+            dropout=args.dropout,
+        )
+        history = model.Train(
+            train_loader_np,
+            val_loader=test_loader_np,
+            epochs=args.epochs,
+            optimizer_name=args.optimizer,
+            lr=args.lr,
+            beta=args.beta,
+            beta1=args.beta,
+            beta2=args.beta2,
+            weight_decay=args.weight_decay,
+            pool_every=args.pool_every,
+            conv_stride=1,
+            conv_padding=None if use_padding else 0,
+        )
+        X_show, y_show = test_loader_np[0]
+        preds, _ = model.predict(X_show[:6], return_prob=True)
+        visualize_samples(X_show[:6], y_show[:6], preds, class_names, n=6, title="NumPy cat/dog small")
+
+
+if __name__ == "__main__":
+    main()
